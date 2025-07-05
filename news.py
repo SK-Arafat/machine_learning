@@ -1,3 +1,7 @@
+# news.py
+# The error you are seeing is an ENVIRONMENT issue. The fix is to create a
+# virtual environment and install the libraries from requirements.txt as described.
+
 import os
 import logging
 import shutil
@@ -14,14 +18,15 @@ from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 from PIL import Image, ImageDraw, ImageFont
 from urllib.parse import urljoin
+import html
 
 # --- Required Libraries Check ---
 try:
     import spacy
     from matplotlib import font_manager
 except ImportError:
-    print("FATAL ERROR: A required library is not installed. Please run 'pip3 install spacy matplotlib edge-tts'")
-    print("AND 'python3 -m spacy download en_core_web_sm'")
+    print("FATAL ERROR: A required library is not installed.")
+    print("Please follow the instructions to create a virtual environment and run 'pip3 install -r requirements.txt'")
     exit()
 
 # --- Configuration ---
@@ -30,83 +35,37 @@ logger = logging.getLogger(__name__)
 
 # --- Constants ---
 VIDEO_WIDTH, VIDEO_HEIGHT = 1080, 1920
-HEADLINES_LIMIT = 5
-MIN_CLIP_DURATION = 3
+HEADLINES_LIMIT = 4
+MIN_CLIP_DURATION = 5
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
 FONT_PATH, NLP_MODEL, UNSPLASH_API_KEY = None, None, None
 VOICE = "en-US-AriaNeural"
 HISTORY_FILE, DESCRIPTION_FILE, LAST_SEGMENT_FILE, CONFIG_FILE = "processed_urls.txt", "video_description.txt", "last_segment.txt", "config.ini"
 FPS = 24
+OUTRO_GIF_NAME = "snap_feed.gif"
 
-# --- Segment-Specific RSS Feeds ---
+# --- Reliable RSS & Custom Feeds ---
 SEGMENT_SOURCES = {
-    "Top Stories": [{"name": "Reuters Top News", "url": "http://feeds.reuters.com/reuters/topNews"}, {"name": "BBC World News", "url": "http://feeds.bbci.co.uk/news/world/rss.xml"}, {"name": "CNN Top Stories", "url": "http://rss.cnn.com/rss/cnn_topstories.rss"}],
-    "Technology": [{"name": "TechCrunch", "url": "https://techcrunch.com/feed/"}, {"name": "Wired", "url": "https://www.wired.com/feed/rss"}, {"name": "The Verge", "url": "https://www.theverge.com/rss/index.xml"}],
-    "Finance": [{"name": "Yahoo Finance", "url": "https://finance.yahoo.com/rss/"}, {"name": "MarketWatch", "url": "http://feeds.marketwatch.com/marketwatch/topstories/"}, {"name": "Investopedia", "url": "https://www.investopedia.com/news-rss-4427700"}, {"name": "Reuters Business", "url": "http://feeds.reuters.com/reuters/businessNews"}],
-    "Sports": [{"name": "ESPN", "url": "https://www.espn.com/espn/rss/news"}, {"name": "BBC Sport", "url": "http://feeds.bbci.co.uk/sport/rss.xml"}, {"name": "TalkSport", "url": "https://talksport.com/feed"}],
-    "Political": [{"name": "Reuters Politics", "url": "http://feeds.reuters.com/reuters/politicsNews"}, {"name": "Politico", "url": "https://rss.politico.com/politico.xml"}, {"name": "The Hill", "url": "https://thehill.com/rss/syndicator/19109"}],
-    "Local": [{"name": "New York Times", "url": "https://rss.nytimes.com/services/xml/rss/nyt/HomePage.xml"}]
+    "Top Stories": [
+        {"name": "The Leading Report", "url": "https://theleadingreport.com/", "type": "custom"},
+        {"name": "Associated Press", "url": "https://storage.googleapis.com/afs-prod/feeds/topnews.xml"},
+        {"name": "Reuters Top News", "url": "http://feeds.reuters.com/reuters/topNews"},
+        {"name": "NPR News", "url": "https://feeds.npr.org/1001/rss.xml"},
+    ],
+    "Political": [
+        {"name": "The Leading Report", "url": "https://theleadingreport.com/", "type": "custom"},
+        {"name": "Reuters Politics", "url": "http://feeds.reuters.com/reuters/politicsNews"},
+        {"name": "Politico", "url": "https://rss.politico.com/politico.xml"},
+        {"name": "The Hill", "url": "https://thehill.com/rss/syndicator/19109"},
+    ],
+    "US National": [
+        {"name": "Reuters US News", "url": "http://feeds.reuters.com/reuters/domesticNews"},
+        {"name": "NPR National News", "url": "https://feeds.npr.org/1003/rss.xml"},
+        {"name": "Associated Press US", "url": "https://storage.googleapis.com/afs-prod/feeds/usnews.xml"},
+    ]
 }
-SEGMENT_ORDER = list(SEGMENT_SOURCES.keys())
+SEGMENT_ORDER = ["Top Stories", "Political", "US National"]
 KEN_BURNS_EFFECTS = ["x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'", "x='(iw-iw/zoom)':y='(ih-ih/zoom)/2'", "x=0:y='(ih-ih/zoom)/2'", "x='(iw-iw/zoom)/2':y='(ih-ih/zoom)'", "x='(iw-iw/zoom)/2':y=0", "x=0:y=0", "x='iw-iw/zoom':y='ih-ih/zoom'"]
-
-
-# --- NEW BUZZ GENERATION ---
-TOPIC_BASED_TEMPLATES = [
-    "Why is everyone suddenly talking about {topic}?",
-    "Everything is about to change because of {topic}.",
-    "Here's what you're not being told about {topic}.",
-    "Could this be the biggest news of the year for {topic}?",
-    "Forget everything you knew about {topic}.",
-    "This is the real story behind {topic}.",
-    "What does this news about {topic} actually mean?"
-]
-
-GENERIC_HOOK_TEMPLATES = [
-    "Breaking: You need to hear this.",
-    "The story is developing right now...",
-    "Okay, you're going to want to see this.",
-    "This just in, and it's big.",
-    "Here’s a story you might have missed.",
-    "Wait, what is happening?",
-    "You won't believe this new report."
-]
-
-def extract_main_subject(headline, nlp_model):
-    """Uses NLP to find the most likely subject (topic) of a headline."""
-    doc = nlp_model(headline)
-    # Prioritize shorter proper noun chunks (e.g., "The White House", "Elon Musk")
-    for chunk in doc.noun_chunks:
-        # We want concise topics, not entire phrases
-        if any(token.pos_ == 'PROPN' for token in chunk) and len(chunk.text.split()) <= 4:
-            return chunk.text.strip()
-            
-    # Fallback to the first single proper noun
-    for token in doc:
-        if token.pos_ == 'PROPN':
-            return token.text
-            
-    # As a last resort, find the first important noun
-    for token in doc:
-        if token.pos_ == 'NOUN' and not token.is_stop:
-            return token.text
-    return None
-
-def generate_buzz_headline(original_headline):
-    """Rewrites a formal headline into an engaging, non-repetitive hook."""
-    topic = extract_main_subject(original_headline, NLP_MODEL)
-
-    # If we found a good, concise topic, use a topic-based template for a high-quality hook.
-    if topic:
-        chosen_template = random.choice(TOPIC_BASED_TEMPLATES)
-        buzzy_headline = chosen_template.replace("{topic}", topic)
-        return " ".join(buzzy_headline.split())
-    
-    # If no suitable topic was found, fall back to a generic hook to avoid repetition.
-    else:
-        return random.choice(GENERIC_HOOK_TEMPLATES)
-
-# --- END OF NEW BUZZ GENERATION ---
 
 
 # --- Setup Functions ---
@@ -114,15 +73,14 @@ def setup_config():
     global UNSPLASH_API_KEY
     if not os.path.exists(CONFIG_FILE):
         logger.error(f"FATAL: Configuration file '{CONFIG_FILE}' not found.")
-        logger.error("Please create it and add your Unsplash API key. See instructions.")
+        config = configparser.ConfigParser(); config['API_KEYS'] = {'UNSPLASH_ACCESS_KEY': 'YOUR_ACCESS_KEY_HERE'}
+        with open(CONFIG_FILE, 'w') as configfile: config.write(configfile)
+        logger.error(f"A template config file has been created. Please add your Unsplash API key.")
         return False
-    config = configparser.ConfigParser()
-    config.read(CONFIG_FILE)
+    config = configparser.ConfigParser(); config.read(CONFIG_FILE)
     UNSPLASH_API_KEY = config.get('API_KEYS', 'UNSPLASH_ACCESS_KEY', fallback=None)
     if not UNSPLASH_API_KEY or UNSPLASH_API_KEY == "YOUR_ACCESS_KEY_HERE":
-        logger.error(f"FATAL: Unsplash API key not found in '{CONFIG_FILE}'.")
-        logger.error("Please get a free key from unsplash.com/developers and add it to the config file.")
-        return False
+        logger.error(f"FATAL: Unsplash API key not found in '{CONFIG_FILE}'."); return False
     logger.info("Unsplash API key loaded successfully.")
     return True
 
@@ -135,13 +93,17 @@ def get_next_segment():
     next_index = (last_index + 1) % len(SEGMENT_ORDER)
     current_segment_name = SEGMENT_ORDER[next_index]
     with open(LAST_SEGMENT_FILE, 'w') as f: f.write(current_segment_name)
-    logger.info(f"Last segment was '{last_segment}'. This run's segment is '{current_segment_name}'.")
+    logger.info(f"This run's segment is '{current_segment_name}'.")
     return current_segment_name, SEGMENT_SOURCES[current_segment_name]
 
 def setup_nlp_model():
     global NLP_MODEL
-    try: NLP_MODEL = spacy.load("en_core_web_sm"); return True
-    except OSError: logger.error("FATAL: spaCy model 'en_core_web_sm' not found. Run 'python3 -m spacy download en_core_web_sm'"); return False
+    try:
+        NLP_MODEL = spacy.load("en_core_web_sm")
+        logger.info("spaCy NLP model loaded successfully.")
+        return True
+    except OSError:
+        logger.error("FATAL: spaCy model 'en_core_web_sm' not found. Run 'python3 -m spacy download en_core_web_sm'"); return False
 
 def load_processed_urls():
     if not os.path.exists(HISTORY_FILE): return set()
@@ -161,96 +123,103 @@ def setup_font():
     logger.error("FATAL: Could not find any suitable system fonts."); return False
 
 def setup_output_directory(): return tempfile.mkdtemp(prefix="news_video_")
-def clean_text(text): return re.sub(r'\s+', ' ', text).strip()
+
+def clean_summary_text(raw_text):
+    text = html.unescape(raw_text); text = re.sub('<[^<]+?>', '', text)
+    junk_patterns = [r'\[\s*\+\s*video\s*\]', r'(?i)\b(continue reading|read more)\b.*', r'<img.*?>']
+    for pattern in junk_patterns: text = re.sub(pattern, '', text, flags=re.IGNORECASE)
+    doc = NLP_MODEL(text); sentences = [sent.text.strip() for sent in doc.sents]
+    clean_summary = ""
+    sentence_count = 0
+    for sent in sentences:
+        if len(sent) > 20: # Prefer slightly longer, more complete sentences
+            clean_summary += sent + " "; sentence_count += 1
+            if sentence_count >= 2 and len(clean_summary) > 180: break # Get 2-3 good sentences
+            if sentence_count >= 3: break
+    return clean_summary.strip()
+
+def scrape_leading_report(processed_urls, limit):
+    logger.info("-> Firing up custom scraper for The Leading Report...")
+    articles = []; base_url = "https://theleadingreport.com/"
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page(user_agent=USER_AGENT)
+            page.goto(base_url, wait_until="networkidle", timeout=60000)
+            link_elements = page.locator("article h3.entry-title a").all()
+            for link_element in link_elements[:limit]:
+                href = link_element.get_attribute("href"); title = link_element.inner_text().strip()
+                full_url = urljoin(base_url, href)
+                if full_url and title and full_url not in processed_urls:
+                    article_page = browser.new_page(user_agent=USER_AGENT)
+                    try:
+                        article_page.goto(full_url, wait_until="domcontentloaded", timeout=45000)
+                        p_tags = article_page.locator("div.entry-content p").all()[:3]
+                        raw_summary = " ".join([p.inner_text() for p in p_tags])
+                        summary = clean_summary_text(raw_summary)
+                        if summary:
+                            articles.append({"title": title, "link": full_url, "summary": summary})
+                            logger.info(f"  -> Scraped: {title[:50]}...")
+                    except Exception as e: logger.error(f"     Failed to process article page {full_url}: {e}")
+                    finally: article_page.close()
+            browser.close()
+    except Exception as e: logger.error(f"An error occurred during custom scraping for The Leading Report: {e}")
+    return articles
 
 def scrape_news(segment_feeds, processed_urls):
-    all_headlines = []; scrape_limit_per_source = 15; headers = {"User-Agent": USER_AGENT}
+    all_headlines = []; headers = {"User-Agent": USER_AGENT}
     for source in segment_feeds:
+        if source.get("type") == "custom":
+            all_headlines.extend(scrape_leading_report(processed_urls, 10))
+            continue
         try:
-            logger.info(f"Scraping {source['name']}")
+            logger.info(f"Scraping {source['name']} (RSS)")
             response = requests.get(source['url'], headers=headers, timeout=15); response.raise_for_status()
-            soup = BeautifulSoup(response.content, 'xml')
-            for item in soup.find_all('item', limit=scrape_limit_per_source):
-                link_tag = item.find('link')
-                if link_tag and link_tag.text:
-                    link = link_tag.text.strip()
-                    if link not in processed_urls:
-                        title_tag = item.find('title')
-                        if title_tag and title_tag.text: all_headlines.append({"title": clean_text(title_tag.text), "link": link})
-        except Exception as e: logger.error(f"Failed to scrape {source['name']}: {e}")
+            soup = BeautifulSoup(response.content, 'lxml-xml')
+            for item in soup.find_all('item', limit=10):
+                link = item.find('link').text.strip() if item.find('link') else None
+                if link and link not in processed_urls:
+                    title = item.find('title').text.strip()
+                    desc_tag = item.find('description')
+                    if title and desc_tag and desc_tag.text:
+                        summary = clean_summary_text(desc_tag.text)
+                        if 50 < len(summary) < 600:
+                            all_headlines.append({ "title": title, "link": link, "summary": summary })
+        except Exception as e: logger.error(f"Failed to scrape RSS feed {source['name']}: {e}")
+
     unique_headlines = list({item['link']: item for item in all_headlines}.values())
     if not unique_headlines: logger.warning("Could not find any new, unprocessed headlines."); return []
     random.shuffle(unique_headlines)
     return unique_headlines[:HEADLINES_LIMIT]
 
 def search_unsplash_for_image(query):
-    """Fallback function to search for an image on Unsplash."""
-    logger.warning(f"Initiating Unsplash API fallback search for query: '{query}'")
+    logger.info(f"Searching Unsplash for: '{query}'")
     headers = {"Authorization": f"Client-ID {UNSPLASH_API_KEY}"}
-    params = {
-        "query": query,
-        "orientation": "portrait",
-        "per_page": 1
-    }
+    params = {"query": query, "orientation": "portrait", "per_page": 1}
     try:
         response = requests.get("https://api.unsplash.com/search/photos", headers=headers, params=params, timeout=15)
         response.raise_for_status()
         data = response.json()
-        if data['results']:
-            image_url = data['results'][0]['urls']['regular']
-            logger.info(f"Success! Found Unsplash image: {image_url}")
-            return image_url
-        else:
-            logger.error(f"Unsplash search for '{query}' yielded no results.")
-            return None
-    except Exception as e:
-        logger.error(f"Unsplash API request failed: {e}"); return None
+        if data['results']: return data['results'][0]['urls']['regular']
+        else: return None
+    except Exception as e: logger.error(f"Unsplash API request failed: {e}"); return None
 
-def create_clip_asset(url, buzzy_headline, original_headline, output_path):
+def create_clip_asset(summary, original_headline, output_path):
     logger.info(f"Creating visual asset for: {original_headline}")
-    image_url = None
-    try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True, args=["--disable-blink-features=AutomationControlled"])
-            context = browser.new_context(user_agent=USER_AGENT)
-            page = context.new_page()
-            page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
-            page.goto(url, wait_until="networkidle", timeout=45000)
-            
-            og_image_locator = page.locator('meta[property="og:image"]')
-            if og_image_locator.count() > 0:
-                image_url = og_image_locator.first.get_attribute('content')
-                logger.info(f"Success! Found 'og:image': {image_url}")
-            else:
-                logger.info("og:image not found. Starting on-page search.")
-                page.evaluate("window.scrollTo(0, document.body.scrollHeight/2)"); page.wait_for_timeout(1000)
-                image_selectors = ['article img', 'main img', '.story-body img', 'figure img']
-                for selector in image_selectors:
-                    for element in page.locator(selector).all():
-                        src = (element.get_attribute('src') or element.get_attribute('data-src'))
-                        if src and src.startswith('http'):
-                            box = element.bounding_box()
-                            if box and box['width'] > 300:
-                                image_url = urljoin(page.url, src); logger.info(f"Found hero image via targeted search: {image_url}"); break
-                    if image_url: break
-            browser.close()
-    except Exception as e: logger.warning(f"Playwright failed to get image from {url}: {e}")
-
-    if not image_url:
-        logger.error("All on-page scraping methods failed. Using Unsplash API fallback.")
-        doc = NLP_MODEL(original_headline)
-        query = " ".join([token.text for token in doc if token.pos_ in ['PROPN', 'NOUN'] and not token.is_stop])
-        if not query: query = original_headline.split(' ')[0]
-        image_url = search_unsplash_for_image(query)
-
-    TEXT_AREA_HEIGHT, IMAGE_AREA_HEIGHT = 800, VIDEO_HEIGHT - 800
-    canvas = Image.new('RGB', (VIDEO_WIDTH, VIDEO_HEIGHT), color='#222222'); draw = ImageDraw.Draw(canvas)
     
-    font_hook = ImageFont.truetype(FONT_PATH, 90)
-    font_reveal = ImageFont.truetype(FONT_PATH, 55)
+    doc = NLP_MODEL(original_headline)
+    query_parts = [token.text for token in doc if token.pos_ in ['PROPN', 'NOUN'] and not token.is_stop and len(token.text) > 3]
+    query = " ".join(query_parts) if query_parts else original_headline
+    image_url = search_unsplash_for_image(query)
+
+    TEXT_AREA_HEIGHT, IMAGE_AREA_HEIGHT = 1100, VIDEO_HEIGHT - 1100
+    canvas = Image.new('RGB', (VIDEO_WIDTH, VIDEO_HEIGHT), color='#181818'); draw = ImageDraw.Draw(canvas)
     
-    y_after_hook = draw_multiline_text(draw, buzzy_headline, font_hook, 980, 180, '#FFFFFF')
-    draw_multiline_text(draw, original_headline, font_reveal, 950, y_after_hook + 40, '#CCCCCC')
+    font_headline = ImageFont.truetype(FONT_PATH, 90)
+    font_summary = ImageFont.truetype(FONT_PATH, 60)
+    
+    y_after_headline = draw_multiline_text(draw, original_headline, font_headline, 980, 150, '#FFFFFF')
+    draw_multiline_text(draw, summary, font_summary, 950, y_after_headline + 60, '#CCCCCC')
     
     if image_url:
         try:
@@ -258,9 +227,9 @@ def create_clip_asset(url, buzzy_headline, original_headline, output_path):
             image_response.raise_for_status()
             article_image = Image.open(image_response.raw).convert("RGB")
             cropped_image = crop_to_fill(article_image, VIDEO_WIDTH, IMAGE_AREA_HEIGHT)
-            canvas.paste(cropped_image, (0, TEXT_AREA_HEIGHT)); logger.info("Successfully attached image to visual.")
-        except Exception as e: logger.error(f"Failed to process final image {image_url}: {e}")
-    else: logger.critical("FATAL: No image could be found from any source for this clip.")
+            canvas.paste(cropped_image, (0, TEXT_AREA_HEIGHT)); logger.info(f"Successfully attached image from Unsplash.")
+        except Exception as e: logger.error(f"Failed to process image {image_url}: {e}")
+    else: logger.warning("Could not find a suitable image from Unsplash for this clip.")
     canvas.save(output_path); return True
 
 async def generate_audio_async(text, output_path):
@@ -271,53 +240,89 @@ def generate_audio(text, output_path):
     except Exception as e: logger.error(f"Error generating audio: {e}"); return False
 
 def check_ffmpeg():
-    ffmpeg_path = shutil.which("ffmpeg")
-    if not ffmpeg_path: logger.error("ffmpeg not found in PATH."); return None
-    return ffmpeg_path
+    return shutil.which("ffmpeg")
 
 def create_video_clips(news_items, temp_dir):
     clips_data = []
     for i, item in enumerate(news_items):
-        original_headline = item['title']
-        buzzy_headline = generate_buzz_headline(original_headline)
+        original_headline, summary = item['title'], item['summary']
+        logger.info(f"--- Processing clip {i+1}/{len(news_items)}: {original_headline[:60]}... ---")
         
-        logger.info(f"--- Processing clip {i+1}/{len(news_items)} ---")
-        logger.info(f"Original headline: {original_headline}")
-        logger.info(f"Buzzy headline:    {buzzy_headline}")
+        visual_path = os.path.join(temp_dir, f"visual_{i}.png")
+        audio_path = os.path.join(temp_dir, f"audio_{i}.mp3")
         
-        visual_path = os.path.join(temp_dir, f"visual_{i}.png"); audio_path = os.path.join(temp_dir, f"audio_{i}.mp3")
+        narration_text = f"{original_headline}. {summary}"
         
-        narration_text = f"{buzzy_headline}... {original_headline}"
-        
-        if not create_clip_asset(item['link'], buzzy_headline, original_headline, visual_path): continue
+        if not create_clip_asset(summary, original_headline, visual_path): continue
         if not generate_audio(narration_text, audio_path): continue
         
         try:
             ffprobe_cmd = ['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', audio_path]
             result = subprocess.run(ffprobe_cmd, capture_output=True, text=True, check=True)
             audio_duration = float(result.stdout.strip())
-            final_duration = max(MIN_CLIP_DURATION, audio_duration + 0.5)
+            final_duration = max(MIN_CLIP_DURATION, audio_duration + 1.5)
             clips_data.append({"visual_path": visual_path, "audio_path": audio_path, "duration": final_duration, "url": item['link'], "title": original_headline})
-        except Exception as e: logger.error(f"Failed to process audio for '{original_headline}': {e}")
+        except Exception as e: logger.error(f"Failed to process audio for clip: {e}")
     return clips_data
+
+def create_outro_clip(temp_dir, ffmpeg_path, gif_path):
+    outro_audio_path = os.path.join(temp_dir, "outro_audio.mp3")
+    outro_image_path = os.path.join(temp_dir, "outro_image.png")
+    outro_base_video_path = os.path.join(temp_dir, "outro_base.mp4")
+    final_outro_path = os.path.join(temp_dir, "outro_final.mp4")
+    outro_duration = 4
+
+    if not generate_audio("Please like and subscribe.", outro_audio_path):
+        raise Exception("Failed to generate outro audio.")
+
+    canvas = Image.new('RGB', (VIDEO_WIDTH, VIDEO_HEIGHT), color='#1A1A1A')
+    draw = ImageDraw.Draw(canvas)
+    font_large = ImageFont.truetype(FONT_PATH, 150)
+    draw.text((VIDEO_WIDTH / 2, 400), "LIKE", font=font_large, fill='#FFFFFF', anchor="ms")
+    draw.text((VIDEO_WIDTH / 2, 580), "& SUBSCRIBE", font=font_large, fill='#FFFFFF', anchor="ms")
+    canvas.save(outro_image_path)
+
+    cmd_base = [ffmpeg_path, '-loop', '1', '-i', outro_image_path, '-i', outro_audio_path, '-c:v', 'libx264', '-c:a', 'aac', '-b:a', '192k', '-pix_fmt', 'yuv420p', '-t', str(outro_duration), '-y', outro_base_video_path]
+    subprocess.run(cmd_base, check=True, capture_output=True, text=True)
+
+    overlay_x, overlay_y = "(W-w)/2", "H/2 - h/2 + 100"
+    cmd_overlay = [ffmpeg_path, '-i', outro_base_video_path, '-i', gif_path, '-filter_complex', f"[1:v]scale=450:-1[gif];[0:v][gif]overlay={overlay_x}:{overlay_y}:shortest=1", '-c:a', 'copy', '-y', final_outro_path]
+    subprocess.run(cmd_overlay, check=True, capture_output=True, text=True)
+    return final_outro_path
 
 def compile_final_video(clips_data, output_path, ffmpeg_path):
     if not clips_data: return False
-    temp_dir = os.path.dirname(clips_data[0]["visual_path"]); concat_list_path = os.path.join(temp_dir, "concat_list.txt"); clip_files = []
+    temp_dir = os.path.dirname(clips_data[0]["visual_path"])
+    concat_list_path = os.path.join(temp_dir, "concat_list.txt")
+    clip_files = []
+    
     for i, clip in enumerate(clips_data):
         clip_path = os.path.join(temp_dir, f"clip_{i}.mp4")
         duration_frames, chosen_effect = int(clip['duration'] * FPS), random.choice(KEN_BURNS_EFFECTS)
-        zoom_level = "1.1"; zoompan_filter = f"scale={VIDEO_WIDTH}*2:-1,zoompan=z='min(zoom+{1/(duration_frames/ (float(zoom_level)-1))},{zoom_level})':d={duration_frames}:{chosen_effect}:s={VIDEO_WIDTH}x{VIDEO_HEIGHT}:fps={FPS}"
+        zoom_level = "1.08"; zoompan_filter = f"scale={VIDEO_WIDTH}*2:-1,zoompan=z='min(zoom+{1/(duration_frames/ (float(zoom_level)-1))},{zoom_level})':d={duration_frames}:{chosen_effect}:s={VIDEO_WIDTH}x{VIDEO_HEIGHT}:fps={FPS}"
         cmd = [ffmpeg_path, '-i', clip['visual_path'], '-i', clip['audio_path'], '-filter_complex', f"[0:v]{zoompan_filter}[v]", '-map', '[v]', '-map', '1:a', '-c:v', 'libx264', '-c:a', 'aac', '-b:a', '192k', '-pix_fmt', 'yuv420p', '-r', str(FPS), '-shortest', '-y', clip_path]
         try:
-            logger.info(f"Applying Ken Burns effect for clip {i+1}...")
-            subprocess.run(cmd, check=True, capture_output=True, text=True); clip_files.append(clip_path)
+            logger.info(f"Assembling video for clip {i+1}...")
+            subprocess.run(cmd, check=True, capture_output=True, text=True)
+            clip_files.append(clip_path)
         except subprocess.CalledProcessError as e: logger.error(f"Error creating video segment {i}: {e.stderr}"); return False
+
     with open(concat_list_path, 'w') as f:
         for clip_file in clip_files: f.write(f"file '{os.path.abspath(clip_file)}'\n")
+
+    if os.path.exists(OUTRO_GIF_NAME):
+        try:
+            logger.info(f"Creating 'Like & Subscribe' outro clip...")
+            outro_clip_path = create_outro_clip(temp_dir, ffmpeg_path, OUTRO_GIF_NAME)
+            with open(concat_list_path, 'a') as f: f.write(f"file '{os.path.abspath(outro_clip_path)}'\n")
+        except Exception as e: logger.error(f"Failed to create outro clip: {e}")
+    else: logger.warning(f"Outro GIF '{OUTRO_GIF_NAME}' not found. Skipping outro.")
+
     final_cmd = [ffmpeg_path, '-f', 'concat', '-safe', '0', '-i', concat_list_path, '-c', 'copy', '-y', output_path]
     try:
-        subprocess.run(final_cmd, check=True, capture_output=True, text=True); logger.info(f"Final video successfully compiled at: {output_path}"); return True
+        subprocess.run(final_cmd, check=True, capture_output=True, text=True)
+        logger.info(f"SUCCESS: Final video compiled at: {output_path}")
+        return True
     except subprocess.CalledProcessError as e: logger.error(f"FATAL: Error compiling final video: {e.stderr}"); return False
 
 def crop_to_fill(image, target_width, target_height):
@@ -341,25 +346,24 @@ def draw_multiline_text(draw, text, font, max_width, start_y, text_color):
     
 def generate_summary_and_hashtags(clips_data, segment_name, output_file):
     logger.info("Generating video description and hashtags...")
-    full_text = ". ".join(clip['title'] for clip in clips_data)
-    doc = NLP_MODEL(full_text)
+    doc = NLP_MODEL(". ".join(clip['title'] for clip in clips_data))
     entities = {ent.text.strip() for ent in doc.ents if ent.label_ in ['PERSON', 'ORG', 'GPE']}
     keywords = {token.text for token in doc if token.pos_ in ['PROPN', 'NOUN'] and not token.is_stop and len(token.text) > 3}
     buzzwords = list(entities.union(keywords)); random.shuffle(buzzwords)
-    top_buzzwords = buzzwords[:5]
-    description = f"--- {segment_name.upper()} NEWS --- \n\nIn today's {segment_name.lower()} briefing:\n"
-    for clip in clips_data: description += f"- {clip['title']}\n"
-    if top_buzzwords: description += f"\nTune in for the latest on {', '.join(top_buzzwords)} and more."
-    clean_segment = segment_name.replace(' ', ''); hashtags_set = {f"#{clean_segment}", "#News", f"#{clean_segment}News"}
-    for word in buzzwords[:10]:
+    description = f"Today's {segment_name} News Briefing:\n\n"
+    for clip in clips_data: description += f"📌 {clip['title']}\n"
+    clean_segment = segment_name.replace(' ', ''); hashtags_set = {f"#{clean_segment}News", "#News", "#DailyNews", "#BreakingNews"}
+    for word in buzzwords[:12]:
         clean_word = "".join(part.capitalize() for part in re.split(r'[^A-Z0-9]', word, flags=re.IGNORECASE) if part)
         if clean_word: hashtags_set.add(f"#{clean_word}")
-    hashtags = "\n\n--- HASHTAGS ---\n\n" + " ".join(list(hashtags_set))
-    with open(output_file, 'w', encoding='utf-8') as f: f.write(description + hashtags)
+    description += "\n---\n" + " ".join(list(hashtags_set))
+    with open(output_file, 'w', encoding='utf-8') as f: f.write(description)
     logger.info(f"Successfully saved description and hashtags to '{output_file}'")
     
 def main():
-    if not setup_config() or not setup_font() or not check_ffmpeg() or not setup_nlp_model(): return
+    ffmpeg_path = check_ffmpeg()
+    if not setup_config() or not setup_font() or not ffmpeg_path or not setup_nlp_model(): return
+    
     current_segment_name, segment_feeds = get_next_segment()
     processed_urls = load_processed_urls()
     temp_dir = None
@@ -368,13 +372,14 @@ def main():
         output_video_path = os.path.join(os.getcwd(), f"news_{current_segment_name.replace(' ', '_')}.mp4")
         news_items = scrape_news(segment_feeds, processed_urls)
         if not news_items: logger.info("No new articles to process. Exiting."); return
+        
         clips_data = create_video_clips(news_items, temp_dir)
         if clips_data:
-            if compile_final_video(clips_data, output_video_path, check_ffmpeg()):
+            if compile_final_video(clips_data, output_video_path, ffmpeg_path):
                 newly_processed_urls = [clip['url'] for clip in clips_data]
                 save_processed_urls(newly_processed_urls)
                 generate_summary_and_hashtags(clips_data, current_segment_name, DESCRIPTION_FILE)
-        else: logger.error("No valid clips created. Final video not generated.")
+        else: logger.error("No valid clips were created. Final video not generated.")
     finally:
         if temp_dir and os.path.exists(temp_dir):
             shutil.rmtree(temp_dir)
